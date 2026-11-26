@@ -37,7 +37,7 @@ canvas{width:100%;height:96px;display:block;margin-top:6px}
 <div class="grid" id="grid"></div>
 
 <script>
-const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e', RX='6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 let RANGE=300;               // 表示する時間幅（秒）
 const KEEP=3*3600*1000;      // 保持する時間（3時間）
 const defs=[
@@ -56,8 +56,9 @@ defs.forEach(d=>{
   $('grid').appendChild(el);
 });
 const trc=document.createElement('div'); trc.className='card';
-trc.innerHTML='<div class="hd"><span>気圧トレンド（3時間）</span><span class="v" id="tr-v">--</span></div><div class="sub" id="tr-s">計測中…（30分たまると表示）</div>';
+trc.innerHTML='<div class="hd"><span>気圧トレンド（標高補正）</span><span class="v" id="tr-v">--</span></div><div class="sub" id="tr-s">GPSで標高を補正して、天気による気圧の変化だけを見ます。</div>';
 $('grid').appendChild(trc);
+data.slp=[];   // 海面換算の気圧 [時刻, hPa]
 
 function fmt(t){
   const d=new Date(t), p=n=>String(n).padStart(2,'0');
@@ -91,28 +92,41 @@ function draw(d){
 }
 
 // 受信: "temp,hum,pres,tvoc,alt,spd,sat,hdop\n"（BLEの分割パケットを改行でつなぐ）
-// 気圧トレンド: 3時間あたりの変化量で判定（30分以上のデータが必要）
+// 気圧トレンド: GPS高度で標高分を取り除いた「海面気圧」の変化で判定
+const med=a=>{const b=a.slice().sort((x,y)=>x-y), m=b.length>>1; return b.length%2?b[m]:(b[m-1]+b[m])/2;};
 function trend(){
-  const a=data.pres, v=$('tr-v'), t=$('tr-s');
-  if(a.length<2) return;
-  const span=a[a.length-1][0]-a[0][0];
-  if(span<30*60000){
+  const a=data.slp, v=$('tr-v'), t=$('tr-s'), W=10*60000, NEED=40*60000;
+  if(a.length<60){
     v.textContent='--';
-    t.textContent='計測中… あと約'+Math.ceil((30*60000-span)/60000)+'分で表示';
+    t.textContent='GPS測位が安定するのを待っています（HDOP 3以下・衛星5個以上のデータを使います）';
     return;
   }
-  const k=Math.min(30,Math.max(1,Math.floor(a.length/4)));
-  const avg=arr=>arr.reduce((sum,p)=>sum+p[1],0)/arr.length;
-  const d=avg(a.slice(-k))-avg(a.slice(0,k));
-  const r=d/span*10800000;
-  let label,adv;
-  if(r<=-3.5){label='急下降';adv='天気が急に崩れる可能性';}
-  else if(r<=-1){label='下降';adv='天気が崩れやすい傾向';}
-  else if(r<1){label='安定';adv='大きな変化なし';}
-  else if(r<3.5){label='上昇';adv='天気は回復傾向';}
-  else{label='急上昇';adv='急な天気の変化に注意';}
-  v.textContent=(r>=0?'+':'')+r.toFixed(1)+' hPa/3h';
-  t.textContent=label+'：'+adv+'（'+Math.round(span/60000)+'分間で '+(d>=0?'+':'')+d.toFixed(1)+' hPa）。移動して標高が変わると、この値も変わります。';
+  const t0=a[0][0], t1=a[a.length-1][0];
+  const e=a.filter(p=>p[0]<t0+W), l=a.filter(p=>p[0]>t1-W);
+  const mean=arr=>arr.reduce((s,p)=>s+p[0],0)/arr.length;
+  const dt=mean(l)-mean(e);
+  if(t1-t0<NEED||e.length<60||l.length<60||dt<30*60000){
+    v.textContent='--';
+    t.textContent='計測中… あと約'+Math.max(1,Math.ceil((NEED-(t1-t0))/60000))+'分で表示';
+    return;
+  }
+  const now_=med(l.map(p=>p[1])), dm=now_-med(e.map(p=>p[1]));
+  const min=Math.round(dt/60000);
+  v.textContent=(dm>=0?'+':'')+dm.toFixed(1)+' hPa / '+min+'分';
+  let msg='海面気圧は約'+now_.toFixed(1)+' hPa。';
+  if(dt<60*60000){
+    msg+='傾向の判定には60分以上のデータが必要です。';
+  }else{
+    const r=dm/dt*10800000;   // 3時間あたりに換算
+    let label,adv;
+    if(r<=-4){label='急下降';adv='天気が急に崩れる可能性';}
+    else if(r<=-1.5){label='下降';adv='天気が崩れやすい傾向';}
+    else if(r<1.5){label='安定';adv='大きな変化なし';}
+    else if(r<4){label='上昇';adv='天気は回復傾向';}
+    else{label='急上昇';adv='急な天気の変化に注意';}
+    msg=label+'：'+adv+'。'+msg;
+  }
+  t.textContent=msg+'GPS高度で補正しているため、誤差は±1〜2hPa程度あります。';
 }
 
 // CSV用の記録（受信した時刻は、スマホの時計）
@@ -130,6 +144,13 @@ function onData(ev){
   }
 }
 function parse(line){
+  if(line==='OK'||line.startsWith('NG')){ if(authRes) authRes(line==='OK',line); return; }
+  if(line.startsWith('L,')){
+    rows.push(line.slice(2));
+    if(rows.length>200000) rows.splice(0,10000);
+    $('csv').textContent='CSV保存 ('+rows.length+')';
+    return;
+  }
   const f=line.split(',').map(parseFloat);
   const now=Date.now();
   defs.forEach((d,i)=>{
@@ -139,9 +160,10 @@ function parse(line){
     $('v-'+d.k).textContent=v.toFixed(d.d)+' '+d.u;
   });
   $('gps').textContent=`衛星 ${f[6]} / HDOP ${f[7]}`;
-  rows.push(ts(new Date(now))+','+f.slice(0,8).map(v=>isFinite(v)?v:'').join(','));
-  if(rows.length>200000) rows.splice(0,10000);
-  $('csv').textContent='CSV保存 ('+rows.length+')';
+  if(isFinite(f[2]) && isFinite(f[8]) && f[7]<=3 && f[6]>=5 && f[8]>-100 && f[8]<9000){
+    const a=data.slp; a.push([now, f[2]/Math.pow(1-f[8]/44330,5.255)]);
+    while(a.length&&a[0][0]<now-KEEP) a.shift();
+  }
   trend();
   defs.forEach(draw);
 }
@@ -156,7 +178,7 @@ function parse(line){
   $('range').appendChild(b);
 });
 
-let dev, userDisc=false, reconnecting=false, wl=null;
+let dev, userDisc=false, reconnecting=false, wl=null, authRes=null, authFail=false, lastErr='';
 const st=t=>$('st').textContent=t;
 
 // 画面スリープ防止（スマホが寝るとBluetoothが切れやすいため）
@@ -174,12 +196,37 @@ document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible' && dev && dev.gatt.connected && !wl) takeWake();
 });
 
+// PIN認証: ESP32のRX特性にPINを書き込み、通知で"OK"が返れば認証完了
+function authenticate(rx){
+  return new Promise(resolve=>{
+    let pin=localStorage.getItem('logger_pin');
+    if(!pin) pin=prompt('ロガーのPINを入力してください');
+    if(!pin){ resolve({ok:false,msg:'PINが入力されませんでした'}); return; }
+    const tm=setTimeout(()=>done(false,'応答がありません'),5000);
+    function done(ok,msg){
+      clearTimeout(tm); authRes=null;
+      if(ok) localStorage.setItem('logger_pin',pin); else localStorage.removeItem('logger_pin');
+      resolve({ok,msg});
+    }
+    authRes=(ok,line)=>done(ok, ok?'':(line==='NG,LOCK'?'PINを間違えすぎたため、1分ほどロックされています':'PINが違います'));
+    rx.writeValue(new TextEncoder().encode(pin)).catch(e=>done(false,e.message));
+  });
+}
 async function openLink(){
   const srv=await dev.gatt.connect();
-  const ch=await (await srv.getPrimaryService(SVC)).getCharacteristic(TX);
+  const svc=await srv.getPrimaryService(SVC);
+  const ch=await svc.getCharacteristic(TX);
+  const rx=await svc.getCharacteristic(RX);
   await ch.startNotifications();
   ch.addEventListener('characteristicvaluechanged',onData);
   buf='';
+  st('認証中…');
+  const r=await authenticate(rx);
+  if(!r.ok){
+    authFail=true; userDisc=true; lastErr=r.msg;
+    try{ dev.gatt.disconnect(); }catch(e){}
+    throw new Error(r.msg);
+  }
   btn.textContent='切断'; st('接続中: '+(dev.name||'ESP32'));
   await takeWake();
 }
@@ -192,20 +239,20 @@ async function autoReconnect(){
     st('切断されました。再接続中… ('+i+'/30)');
     await new Promise(r=>setTimeout(r,3000));
     if(userDisc) break;
-    try{ await openLink(); reconnecting=false; return; }catch(e){}
+    try{ await openLink(); reconnecting=false; return; }catch(e){ lastErr=e.message; }
   }
   reconnecting=false; btn.textContent='接続';
-  st(userDisc ? '停止しました' : '再接続できませんでした。「接続」を押してください');
+  st(authFail ? '接続できません: '+lastErr : userDisc ? '停止しました' : '再接続できませんでした。「接続」を押してください');
 }
 function onDisc(){
   releaseWake();
-  if(userDisc){ st('切断しました'); btn.textContent='接続'; return; }
+  if(userDisc){ if(!authFail) st('切断しました'); btn.textContent='接続'; return; }
   autoReconnect();
 }
 
 async function connect(){
   try{
-    userDisc=false;
+    userDisc=false; authFail=false;
     dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
     if(!dev._l){ dev._l=1; dev.addEventListener('gattserverdisconnected',onDisc); }
     st('接続中…');
@@ -222,10 +269,10 @@ btn.onclick=()=>{
 $('csv').onclick=()=>{
   const b=$('csv');
   if(!rows.length){ b.textContent='データなし'; setTimeout(()=>b.textContent='CSV保存 (0)',1500); return; }
-  const blob=new Blob(['time,temp,hum,pres,tvoc,alt,spd,sat,hdop\n'+rows.join('\n')+'\n'],{type:'text/csv'});
+  const blob=new Blob(['name,latitude,longitude,alt_m,spd_kmh,temp_C,hum_pct,pres_hPa,tvoc_ppb,satellites,hdop,fix\n'+rows.join('\n')+'\n'],{type:'text/csv'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download='logger_'+ts(new Date()).replace(/[-: ]/g,'').replace(/^(\d{8})(\d{6})$/,'$1_$2')+'.csv';
+  a.download=rows[0].slice(0,19).replace(/[-: ]/g,'').replace(/^(\d{8})(\d{6})$/,'$1_$2')+'.csv';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href),10000);
 };
