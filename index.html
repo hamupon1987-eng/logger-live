@@ -20,16 +20,22 @@ button:focus-visible{outline:2px solid var(--tx);outline-offset:2px}
 .hd{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--mu)}
 .v{font-size:26px;font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums}
 canvas{width:100%;height:96px;display:block;margin-top:6px}
+.range{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.range button{padding:6px 12px;font-size:13px;font-weight:500;background:var(--card);color:var(--tx);border:1px solid var(--ln)}
+.range button.on{background:var(--ac);color:#fff;border-color:transparent}
+@media(prefers-color-scheme:dark){.range button.on{color:#08140d}}
 </style>
 </head>
 <body>
 <header><h1>ESP32 ロガー</h1><button id="btn">接続</button></header>
+<div class="range" id="range"></div>
 <div class="info"><span id="st">未接続</span><span id="gps">衛星 -- / HDOP --</span></div>
 <div class="grid" id="grid"></div>
 
 <script>
 const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-const N=300; // 直近300点（1秒間隔で5分）
+let RANGE=300;               // 表示する時間幅（秒）
+const KEEP=3*3600*1000;      // 保持する時間（3時間）
 const defs=[
   {k:'temp',n:'気温',u:'°C',c:'#f97316',d:1},
   {k:'hum', n:'湿度',u:'%',c:'#06b6d4',d:0},
@@ -46,23 +52,34 @@ defs.forEach(d=>{
   $('grid').appendChild(el);
 });
 
+function fmt(t){
+  const d=new Date(t), p=n=>String(n).padStart(2,'0');
+  return p(d.getHours())+':'+p(d.getMinutes())+(RANGE<=300?':'+p(d.getSeconds()):'');
+}
 function draw(d){
-  const cv=$('c-'+d.k), r=devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
-  cv.width=w*r; cv.height=h*r;
+  const cv=$('c-'+d.k), r=devicePixelRatio||1, w=cv.clientWidth, H=cv.clientHeight, h=H-14;
+  cv.width=w*r; cv.height=H*r;
   const x=cv.getContext('2d'); x.scale(r,r);
-  const a=data[d.k]; if(a.length<2) return;
-  let mn=Math.min(...a), mx=Math.max(...a);
-  if(mx-mn<0.5){const m=(mx+mn)/2; mn=m-.25; mx=m+.25;}
-  const pad=(mx-mn)*.12; mn-=pad; mx+=pad;
+  const end=Date.now(), start=end-RANGE*1000;
+  const a=data[d.k].filter(p=>p[0]>=start);
+  x.fillStyle='#8a9a90'; x.font='10px sans-serif';
+  x.fillText(fmt(start),3,H-3);
+  const m=fmt(start+RANGE*500); x.fillText(m,w/2-x.measureText(m).width/2,H-3);
+  const e=fmt(end); x.fillText(e,w-x.measureText(e).width-3,H-3);
   x.strokeStyle='rgba(128,128,128,.25)'; x.lineWidth=1;
   for(let i=0;i<=2;i++){const y=Math.round(i*(h-1)/2)+.5; x.beginPath(); x.moveTo(0,y); x.lineTo(w,y); x.stroke();}
-  x.fillStyle='#8a9a90'; x.font='10px sans-serif';
+  if(a.length<2) return;
+  let mn=Infinity, mx=-Infinity;
+  for(const p of a){ if(p[1]<mn) mn=p[1]; if(p[1]>mx) mx=p[1]; }
+  if(mx-mn<0.5){const c=(mx+mn)/2; mn=c-.25; mx=c+.25;}
+  const pad=(mx-mn)*.12; mn-=pad; mx+=pad;
   x.fillText(mx.toFixed(d.d),3,11); x.fillText(mn.toFixed(d.d),3,h-3);
   x.strokeStyle=d.c; x.lineWidth=2; x.lineJoin='round'; x.beginPath();
-  a.forEach((v,i)=>{
-    const px=w-(a.length-1-i)/(N-1)*w, py=h-(v-mn)/(mx-mn)*h;
+  const step=Math.max(1,Math.floor(a.length/(w*1.5)));
+  for(let i=0;i<a.length;i+=step){
+    const px=(a[i][0]-start)/(RANGE*1000)*w, py=h-(a[i][1]-mn)/(mx-mn)*h;
     i?x.lineTo(px,py):x.moveTo(px,py);
-  });
+  }
   x.stroke();
 }
 
@@ -78,15 +95,26 @@ function onData(ev){
 }
 function parse(line){
   const f=line.split(',').map(parseFloat);
+  const now=Date.now();
   defs.forEach((d,i)=>{
     const v=f[i];
     if(!isFinite(v)) return;
-    const a=data[d.k]; a.push(v); if(a.length>N) a.shift();
+    const a=data[d.k]; a.push([now,v]); while(a.length&&a[0][0]<now-KEEP) a.shift();
     $('v-'+d.k).textContent=v.toFixed(d.d)+' '+d.u;
   });
   $('gps').textContent=`衛星 ${f[6]} / HDOP ${f[7]}`;
   defs.forEach(draw);
 }
+
+[[60,'1分'],[300,'5分'],[1800,'30分'],[3600,'1時間'],[10800,'3時間']].forEach(([sec,label])=>{
+  const b=document.createElement('button'); b.textContent=label; if(sec===RANGE) b.className='on';
+  b.onclick=()=>{
+    RANGE=sec;
+    document.querySelectorAll('#range button').forEach(x=>x.className='');
+    b.className='on'; defs.forEach(draw);
+  };
+  $('range').appendChild(b);
+});
 
 let dev;
 const st=t=>$('st').textContent=t;
