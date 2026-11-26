@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 ロガー ライブ</title>
+<style>
+:root{--bg:#f3f5f2;--card:#fff;--tx:#16201a;--mu:#6b7a70;--ln:#dfe5e0;--ac:#1f7a4d}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1411;--card:#17201a;--tx:#e6efe9;--mu:#8a9a90;--ln:#27332b;--ac:#3ddc84}}
+*{box-sizing:border-box}
+body{margin:0;padding:14px;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+h1{font-size:17px;margin:0;font-weight:600}
+button{padding:9px 18px;border:0;border-radius:8px;background:var(--ac);color:#fff;font-size:14px;font-weight:600}
+@media(prefers-color-scheme:dark){button{color:#08140d}}
+button:focus-visible{outline:2px solid var(--tx);outline-offset:2px}
+.info{display:flex;justify-content:space-between;font-size:12px;color:var(--mu);margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:10px}
+.card{background:var(--card);border:1px solid var(--ln);border-radius:10px;padding:10px 12px}
+.hd{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--mu)}
+.v{font-size:26px;font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums}
+canvas{width:100%;height:96px;display:block;margin-top:6px}
+</style>
+</head>
+<body>
+<header><h1>ESP32 ロガー</h1><button id="btn">接続</button></header>
+<div class="info"><span id="st">未接続</span><span id="gps">衛星 -- / HDOP --</span></div>
+<div class="grid" id="grid"></div>
+
+<script>
+const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e', TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const N=300; // 直近300点（1秒間隔で5分）
+const defs=[
+  {k:'temp',n:'気温',u:'°C',c:'#f97316',d:1},
+  {k:'hum', n:'湿度',u:'%',c:'#06b6d4',d:0},
+  {k:'pres',n:'気圧',u:'hPa',c:'#a855f7',d:1},
+  {k:'tvoc',n:'TVOC',u:'ppb',c:'#10b981',d:0},
+  {k:'alt', n:'標高',u:'m',c:'#3b82f6',d:1},
+  {k:'spd', n:'速度',u:'km/h',c:'#eab308',d:1}
+];
+const data={}, $=id=>document.getElementById(id), btn=$('btn');
+defs.forEach(d=>{
+  data[d.k]=[];
+  const el=document.createElement('div'); el.className='card';
+  el.innerHTML=`<div class="hd"><span>${d.n}</span><span class="v" id="v-${d.k}">--</span></div><canvas id="c-${d.k}"></canvas>`;
+  $('grid').appendChild(el);
+});
+
+function draw(d){
+  const cv=$('c-'+d.k), r=devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*r; cv.height=h*r;
+  const x=cv.getContext('2d'); x.scale(r,r);
+  const a=data[d.k]; if(a.length<2) return;
+  let mn=Math.min(...a), mx=Math.max(...a);
+  if(mx-mn<0.5){const m=(mx+mn)/2; mn=m-.25; mx=m+.25;}
+  const pad=(mx-mn)*.12; mn-=pad; mx+=pad;
+  x.strokeStyle='rgba(128,128,128,.25)'; x.lineWidth=1;
+  for(let i=0;i<=2;i++){const y=Math.round(i*(h-1)/2)+.5; x.beginPath(); x.moveTo(0,y); x.lineTo(w,y); x.stroke();}
+  x.fillStyle='#8a9a90'; x.font='10px sans-serif';
+  x.fillText(mx.toFixed(d.d),3,11); x.fillText(mn.toFixed(d.d),3,h-3);
+  x.strokeStyle=d.c; x.lineWidth=2; x.lineJoin='round'; x.beginPath();
+  a.forEach((v,i)=>{
+    const px=w-(a.length-1-i)/(N-1)*w, py=h-(v-mn)/(mx-mn)*h;
+    i?x.lineTo(px,py):x.moveTo(px,py);
+  });
+  x.stroke();
+}
+
+// 受信: "temp,hum,pres,tvoc,alt,spd,sat,hdop\n"（BLEの分割パケットを改行でつなぐ）
+let buf='';
+function onData(ev){
+  buf+=new TextDecoder().decode(ev.target.value);
+  let i;
+  while((i=buf.indexOf('\n'))>=0){
+    const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
+    if(line) parse(line);
+  }
+}
+function parse(line){
+  const f=line.split(',').map(parseFloat);
+  defs.forEach((d,i)=>{
+    const v=f[i];
+    if(!isFinite(v)) return;
+    const a=data[d.k]; a.push(v); if(a.length>N) a.shift();
+    $('v-'+d.k).textContent=v.toFixed(d.d)+' '+d.u;
+  });
+  $('gps').textContent=`衛星 ${f[6]} / HDOP ${f[7]}`;
+  defs.forEach(draw);
+}
+
+let dev;
+const st=t=>$('st').textContent=t;
+async function connect(){
+  try{
+    dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    dev.addEventListener('gattserverdisconnected',()=>{st('切断されました'); btn.textContent='接続';});
+    st('接続中…');
+    const srv=await dev.gatt.connect();
+    const ch=await (await srv.getPrimaryService(SVC)).getCharacteristic(TX);
+    await ch.startNotifications();
+    ch.addEventListener('characteristicvaluechanged',onData);
+    st('接続中: '+(dev.name||'ESP32')); btn.textContent='切断';
+  }catch(e){ st('接続できません: '+e.message); }
+}
+btn.onclick=()=>{ dev&&dev.gatt.connected ? dev.gatt.disconnect() : connect(); };
+addEventListener('resize',()=>defs.forEach(draw));
+if(!navigator.bluetooth) st('このブラウザは非対応です（Android: Chrome / iPhone: Bluefy）');
+</script>
+</body>
+</html>
